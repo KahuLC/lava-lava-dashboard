@@ -183,6 +183,15 @@ async function xeroTenantId(env, h) {
 
 const WAGE_RE = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
 
+/* Owner-confirmed at reconciliation (accountant's setup): these specific wage-
+   keyword accounts are administrative/fixed cost, not variable venue labour -
+   they sit in Overheads, not Wage %. Exact-match, not a broad pattern, so a
+   future differently-named account is never silently swept in either way. */
+const WAGE_EXCLUDE_LABELS = ['wages and salaries (overhead)', 'superannuation (overhead)', 'workcover'];
+function isWageExcluded(label) {
+  return WAGE_EXCLUDE_LABELS.indexOf((label || '').trim().toLowerCase()) !== -1;
+}
+
 function parseAmount(v) {
   if (v === null || v === undefined) return 0;
   const n = parseFloat(String(v).replace(/,/g, ''));
@@ -231,7 +240,7 @@ function wagesSuperFromSection(section) {
   let sum = 0;
   walkRows(section.Rows, (r) => {
     const label = (r.Cells && r.Cells[0] && r.Cells[0].Value) || '';
-    if (WAGE_RE.test(label)) {
+    if (WAGE_RE.test(label) && !isWageExcluded(label)) {
       const c = r.Cells || [];
       sum += parseAmount(c[c.length - 1] && c[c.length - 1].Value);
     }
@@ -285,7 +294,7 @@ function wagesSuperArrayRaw(section, n) {
   const vals = new Array(n).fill(0);
   walkRows(section.Rows, (r) => {
     const label = (r.Cells && r.Cells[0] && r.Cells[0].Value) || '';
-    if (!WAGE_RE.test(label)) return;
+    if (!WAGE_RE.test(label) || isWageExcluded(label)) return;
     const c = r.Cells || [];
     for (let i = 0; i < n; i++) vals[i] += parseAmount(c[1 + i] && c[1 + i].Value);
   });
@@ -972,39 +981,6 @@ export default {
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
       return authRoute[2] === 'start' ? authStart(env, authRoute[1], url) : authCallback(env, authRoute[1], url);
-    }
-    /* TEMPORARY diagnostic route - remove once Xero P&L mapping is confirmed
-       correct at reconciliation. No secrets exposed: just section titles and
-       totals, which the owner can already see in Xero itself. */
-    if (path === '/debug/pl' && request.method === 'GET') {
-      if (!loggedIn) return Response.redirect(url.origin + '/', 302);
-      const from = url.searchParams.get('from');
-      const to = url.searchParams.get('to');
-      if (!from || !to) return json({ error: 'add ?from=YYYY-MM-DD&to=YYYY-MM-DD to the address' }, 400);
-      try {
-        const h = makeHelpers(env, 'accounting');
-        const tenantId = await xeroTenantId(env, h);
-        const rurl = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to + '&standardLayout=true';
-        const data = await h.fetchJson(rurl, { headers: { 'Xero-Tenant-Id': tenantId, 'Accept': 'application/json' } });
-        const report = data && data.Reports && data.Reports[0];
-        const sections = (report && report.Rows || []).filter((r) => r.RowType === 'Section').map((r) => ({
-          title: r.Title || '(no title)',
-          classifiedAs: classifySectionTitle(r.Title),
-          sectionTotal: sectionTotal(r),
-          wagesSuperMatched: wagesSuperFromSection(r),
-          lines: (function flat(rows) {
-            const out = [];
-            walkRows(rows, (rr) => {
-              const c = rr.Cells || [];
-              out.push({ label: (c[0] && c[0].Value) || '', amount: parseAmount(c[c.length - 1] && c[c.length - 1].Value) });
-            });
-            return out;
-          })(r.Rows)
-        }));
-        return json({ ok: true, from, to, sections });
-      } catch (e) {
-        return json({ ok: false, error: String((e && e.message) || e), status: e && e.status }, 500);
-      }
     }
     if (path === '/api/disconnect' && request.method === 'POST') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
