@@ -131,12 +131,49 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
+    /* Lightspeed Restaurant O-Series: live API is gated behind the owner's
+       account manager (a paid API plan, per current Lightspeed docs) - not a
+       self-serve connection. Fallback ladder rung 3 (guided upload) is wired
+       instead so the count and Average customer spend are live today; the
+       live API can replace this later with no rework elsewhere. */
+    configured: true,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      const ls = await lastSync(env, 'pos');
+      return { connected: !!ls, lastSync: ls };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      return { count: Math.round(r.sums.count || 0) };
+    },
+    async fetchMonthly(env, h, q) {
+      const r = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: r.months, count: r.byMonth.map((m) => (m ? Math.round(m.count || 0) : null)) };
+    },
+    /* Lightspeed's Sales Summary export (CSV/XLSX, by day) - "Number of Sales"
+       already excludes refunds/returns, matching kpi-spec.md's transaction
+       count definition. Column names are matched loosely (case-insensitive)
+       so small export-template differences don't break the upload. */
+    async parseExport(env, h, raw) {
+      const rows = parseCsvText(raw.text);
+      if (!rows.length) { const e = new Error('empty file'); throw e; }
+      const header = rows[0].map((c) => (c || '').trim().toLowerCase());
+      const dateIdx = header.findIndex((c) => /date/.test(c));
+      const countIdx = header.findIndex((c) => /number of sales|no\.? of sales|sales count|transaction|receipts?|covers?|orders?|count/.test(c));
+      if (dateIdx === -1 || countIdx === -1) {
+        const e = new Error('could not find date/count columns in that export'); throw e;
+      }
+      const out = [];
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (!r || r.length <= Math.max(dateIdx, countIdx)) continue;
+        const date = normaliseDateStr(r[dateIdx]);
+        if (!date) continue;
+        out.push({ date, count: Math.round(parseAmount(r[countIdx])) });
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -357,6 +394,49 @@ async function fetchMonthlyPL(env, h, tenantId, monthsAsc) {
     overheads.push(...series.overheads);
   }
   return { months: monthsAsc, revenue, cogs, wagesSuper, overheads };
+}
+
+
+/* ---------------- Lightspeed (POS, guided-upload rung) helpers ---------- */
+
+/* Minimal CSV parser: handles quoted fields with embedded commas/quotes,
+   which is all Lightspeed's own exports need. */
+function parseCsvText(text) {
+  const rows = [];
+  const lines = String(text || '').split(/\r\n|\n|\r/).filter((l) => l.length);
+  for (const line of lines) {
+    const cells = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQ) {
+        if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+        else cur += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === ',') { cells.push(cur); cur = ''; }
+      else cur += ch;
+    }
+    cells.push(cur);
+    rows.push(cells);
+  }
+  return rows;
+}
+
+/* Accepts YYYY-MM-DD, DD/MM/YYYY or DD-MM-YYYY (Australian day-first), or
+   anything Date.parse understands (e.g. "1 Jul 2026") -> 'YYYY-MM-DD'. */
+function normaliseDateStr(raw) {
+  const s = (raw || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  let m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  m = /^(\d{1,2})-(\d{1,2})-(\d{4})$/.exec(s);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  const t = Date.parse(s);
+  if (!isNaN(t)) {
+    const d = new Date(t);
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+  }
+  return null;
 }
 
 /* ============================================================================
