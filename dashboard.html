@@ -1235,8 +1235,10 @@ function uploadPanel(s) {
   wrap.style.background = 'var(--c-purple-bg)';
   wrap.style.borderColor = 'var(--c-purple-border)';
   wrap.style.color = 'var(--c-purple-text)';
+  var upR = resolvePeriod(state.period, state.customFrom, state.customTo);
   wrap.innerHTML = '<b>Add data from a file.</b> Export the usual report from '
-    + esc(s.name) + ' (or use the one it emails you), then drop it here. Your AI told you the upload code the first time.';
+    + esc(s.name) + ' (or use the one it emails you), then drop it here. Your AI told you the upload code the first time.'
+    + '<br><span style="font-size:12px;opacity:0.85">This will be saved as your figures for <b>' + esc(fmtRange(upR)) + '</b> — the period currently chosen on the Dashboard tab. Switch periods there first if you meant a different range.</span>';
 
   var row = el('div', 'conn-actions');
   var file = document.createElement('input');
@@ -1268,7 +1270,7 @@ function uploadPanel(s) {
     msg.textContent = 'Uploading\u2026';
     var reader = new FileReader();
     reader.onload = function () {
-      fetch('/api/ingest?source=' + s.key, {
+      fetch('/api/ingest?source=' + s.key + '&from=' + iso(upR.from) + '&to=' + iso(upR.to), {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + useCode, 'Content-Type': 'text/plain' },
         body: reader.result

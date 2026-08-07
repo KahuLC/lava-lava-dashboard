@@ -144,35 +144,49 @@ const ADAPTERS = {
       return { connected: !!ls, lastSync: ls };
     },
     async fetchRange(env, h, q) {
+      const rt = await getRangeTotal(env, 'pos', q.from, q.to);
+      if (rt !== null) return { count: Math.round(rt) };
       const r = await h.readIngested(q.from, q.to);
-      return { count: Math.round(r.sums.count || 0) };
+      if (r.daysWithData > 0) return { count: Math.round(r.sums.count || 0) };
+      const e = new Error('no POS data uploaded for this exact period yet'); e.status = 404; throw e;
     },
     async fetchMonthly(env, h, q) {
-      const r = await h.monthlyIngested(q.fromMonth, q.toMonth);
-      return { months: r.months, count: r.byMonth.map((m) => (m ? Math.round(m.count || 0) : null)) };
+      const months = monthList(q.fromMonth, q.toMonth);
+      const counts = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const mFrom = mo + '-01', mTo = mo + '-' + String(lastDay).padStart(2, '0');
+        const rt = await getRangeTotal(env, 'pos', mFrom, mTo);
+        if (rt !== null) { counts.push(Math.round(rt)); continue; }
+        const r = await h.readIngested(mFrom, mTo);
+        counts.push(r.daysWithData ? Math.round(r.sums.count || 0) : null);
+      }
+      return { months, count: counts };
     },
-    /* Lightspeed's Sales Summary export (CSV/XLSX, by day) - "Number of Sales"
-       already excludes refunds/returns, matching kpi-spec.md's transaction
-       count definition. Column names are matched loosely (case-insensitive)
-       so small export-template differences don't break the upload. */
-    async parseExport(env, h, raw) {
+    /* Lightspeed Restaurant O-Series free tier has no per-day export (that's
+       gated behind premium reports/account-manager API access) - only a
+       single total for whatever date range is selected on-screen. So the
+       owner uploads a whole-period export (matched to whichever period is
+       selected on the Dashboard tab - see dashboard.html's uploadPanel,
+       which sends it as ?from=&to=) and it's stored against that exact
+       range, not spread across days. Tries a few of Lightspeed's own report
+       shapes so more than one of the exported CSVs will work:
+         - a table with a "Number of Sales"/"transactions"/"orders"/"receipts"
+           column (e.g. order_types.csv) - summed across all rows
+         - a table with a bare "Sales" column (e.g. day_of_week_performance.csv,
+           hour_of_day_performance.csv) - summed across all rows
+         - free text containing "<n> sales" (e.g. total_sales.csv's summary
+           sentence) */
+    async parseRangeTotal(env, h, raw) {
       const rows = parseCsvText(raw.text);
-      if (!rows.length) { const e = new Error('empty file'); throw e; }
-      const header = rows[0].map((c) => (c || '').trim().toLowerCase());
-      const dateIdx = header.findIndex((c) => /date/.test(c));
-      const countIdx = header.findIndex((c) => /number of sales|no\.? of sales|sales count|transaction|receipts?|covers?|orders?|count/.test(c));
-      if (dateIdx === -1 || countIdx === -1) {
-        const e = new Error('could not find date/count columns in that export'); throw e;
+      let total = sumCsvCountColumn(rows);
+      if (total === null) total = extractSalesCountFromText(raw.text);
+      if (total === null) {
+        const e = new Error('could not find a sales/transaction count in that file');
+        throw e;
       }
-      const out = [];
-      for (let i = 1; i < rows.length; i++) {
-        const r = rows[i];
-        if (!r || r.length <= Math.max(dateIdx, countIdx)) continue;
-        const date = normaliseDateStr(r[dateIdx]);
-        if (!date) continue;
-        out.push({ date, count: Math.round(parseAmount(r[countIdx])) });
-      }
-      return out;
+      return Math.round(total);
     }
   },
 
@@ -439,6 +453,69 @@ function normaliseDateStr(raw) {
   return null;
 }
 
+
+/* Sum a "count-like" column across every data row of a CSV table (used when
+   the export lists one row per category rather than one row per day - e.g.
+   order types, or day-of-week/hour-of-day breakdowns). Prefers an explicit
+   "Number of Sales"/"transactions"/"orders"/"receipts" column; falls back to
+   a bare "Sales" column (present in several Lightspeed breakdown exports as
+   a whole-number count, distinct from its dollar "Total Revenue" column). */
+function findCountColumnIndex(headerLower) {
+  /* Tried in priority order (most specific first) - a whole scan of the
+     header per pattern, so a strong match anywhere always wins over a loose
+     one, regardless of column position (e.g. "Number of Sales" must win over
+     an incidental "order" substring inside an unrelated "Order Type" label
+     column - see the false-match this caught in testing). */
+  const patterns = [
+    /number of sales|no\.? of sales|sales count/i,
+    /transactions?|receipts?/i,
+    /\borders?\b/i,
+    /^sales$/i
+  ];
+  for (const p of patterns) {
+    const idx = headerLower.findIndex((h) => p.test(h));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+function sumCsvCountColumn(rows) {
+  if (!rows.length || rows.length < 2) return null;
+  const headerLower = rows[0].map((c) => (c || '').trim().toLowerCase());
+  const idx = findCountColumnIndex(headerLower);
+  if (idx === -1) return null;
+  let sum = 0, any = false;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || r.length <= idx) continue;
+    const raw = (r[idx] || '').trim();
+    if (raw === '') continue;
+    /* Only accept cells that are actually numeric once $/,/% are stripped -
+       a text label sitting in the same column (e.g. "Unspecified") must
+       never be silently read as a 0. */
+    const cleaned = raw.replace(/[$,%]/g, '').trim();
+    if (!/^-?\d+(\.\d+)?$/.test(cleaned)) continue;
+    sum += parseFloat(cleaned);
+    any = true;
+  }
+  return any ? sum : null;
+}
+/* Fallback for Lightspeed's "Total Sales" export, which states the count in
+   a sentence rather than a column: e.g. "6178 sales at an average...". */
+function extractSalesCountFromText(text) {
+  const m = /([\d,]+)\s*sales\b/i.exec(String(text || ''));
+  return m ? parseAmount(m[1]) : null;
+}
+
+/* Whole-period totals (the guided-upload rung for a source with no per-day
+   export) - keyed by the exact from/to the owner uploaded for. */
+async function saveRangeTotal(env, source, from, to, value) {
+  await env.TOKENS.put('rangetotal:' + source + ':' + from + ':' + to, String(value));
+}
+async function getRangeTotal(env, source, from, to) {
+  const v = await env.TOKENS.get('rangetotal:' + source + ':' + from + ':' + to);
+  return v === null ? null : parseFloat(v);
+}
+
 /* ============================================================================
    Everything below is the shell. You should rarely need to edit it.
 ============================================================================ */
@@ -448,6 +525,7 @@ class NotConfigured extends Error {
 }
 
 const PLAIN_ERRORS = {
+  404: 'No data uploaded yet for this exact period. Switch to the period you have an export for, or upload one that matches this range.',
   401: 'This connection needs reconnecting. Click Reconnect and log in again.',
   403: 'This connection is missing a permission it needs. Your AI will sort out the access.',
   429: 'The tool is asking us to slow down. Wait a few minutes, then refresh.',
@@ -853,12 +931,30 @@ async function monthlyIngested(env, source, fromMonth, toMonth) {
    The source's adapter.parseExport() turns it into day rows. */
 async function apiIngest(env, request, url) {
   const source = url.searchParams.get('source');
+  const rFrom = url.searchParams.get('from');
+  const rTo = url.searchParams.get('to');
   if (!['accounting', 'pos', 'rostering'].includes(source)) return json({ error: 'unknown source' }, 400);
   const auth = request.headers.get('Authorization') || '';
   if (!env.INGEST_TOKEN || auth !== 'Bearer ' + env.INGEST_TOKEN) {
     return json({ error: 'not authorised', plain: 'That upload code didn\u2019t match. Check it with your AI and try again.' }, 401);
   }
   const adapter = ADAPTERS[source];
+  const validFrom = rFrom && /^\d{4}-\d{2}-\d{2}$/.test(rFrom);
+  const validTo = rTo && /^\d{4}-\d{2}-\d{2}$/.test(rTo);
+  if (validFrom && validTo && typeof adapter.parseRangeTotal === 'function') {
+    const text = await request.text();
+    if (text.length > 2000000) return json({ error: 'too big', plain: 'That file is too large. Export a shorter date range and try again.' }, 413);
+    try {
+      const total = await adapter.parseRangeTotal(env, makeHelpers(env, source), {
+        text, contentType: request.headers.get('Content-Type') || ''
+      });
+      await saveRangeTotal(env, source, rFrom, rTo, total);
+      await noteSync(env, source);
+      return json({ ok: true, days: 1, total });
+    } catch (e) {
+      return json({ error: 'parse failed', plain: 'That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI.' }, 422);
+    }
+  }
   if (!adapter || typeof adapter.parseExport !== 'function') {
     return json({ error: 'no parser', plain: 'This source isn\u2019t set up for file uploads yet. Your AI adds that when this path is chosen.' }, 501);
   }
@@ -898,7 +994,7 @@ async function sourceStatus(env, source) {
     const st = await adapter.status(env, h);
     return {
       configured: true,
-      ingest: typeof adapter.parseExport === 'function',
+      ingest: typeof adapter.parseExport === 'function' || typeof adapter.parseRangeTotal === 'function',
       connected: !!(st && st.connected),
       org: (st && st.org) || null,
       sandbox: !!(st && st.sandbox),
@@ -908,7 +1004,7 @@ async function sourceStatus(env, source) {
   } catch (err) {
     return {
       configured: true,
-      ingest: typeof adapter.parseExport === 'function',
+      ingest: typeof adapter.parseExport === 'function' || typeof adapter.parseRangeTotal === 'function',
       connected: false,
       org: null,
       sandbox: false,
